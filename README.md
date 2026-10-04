@@ -73,7 +73,7 @@ Chunk sizes are estimated from character counts. The default `3` is tuned for Cy
 
 **Chunked refine** — the compacted prefix is cut into chunks at turn boundaries and merged sequentially by a cheaper summarizer into a structured checkpoint.
 **Cheap and long** — the compression runs on a small local or cloud model, so the main model doesn't pay for it and long histories fit on a modest context window.
-**Resilient** — chunks re-split on output limits, computed chunks are cached, and a failing intermediate compression degrades instead of aborting.
+**Resilient** — chunks re-split on output limits, computed chunks are cached per session/summarizer/budgets, and a failing intermediate compression degrades instead of aborting.
 
 See [DESIGN.md](docs/DESIGN.md) for the full algorithm — budget derivation, chunking, the refine loop, resilience, and the char-based sizing rationale.
 See [CHANGELOG.md](CHANGELOG.md) for notable changes per version.

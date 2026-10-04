@@ -30,7 +30,7 @@
  *     always fit into the context window.
  *   - Summary language is always English (small models do better with EN,
  *     fewer tokens); a checkpoint-time header is added; in-memory chunk
- *     caching speeds up retries.
+ *     caching (scoped per session, summarizer and budgets) speeds up retries.
  *
  * Settings (all optional, all with sensible auto values):
  *   model               "provider/id" — summarizer model (also set via /compact-model)
@@ -248,9 +248,16 @@ class ModelPicker extends Container {
 // Retry infrastructure: in-memory chunk cache (C4), hash, length-cap error (C1)
 // ============================================================================
 
-/** In-memory cache of summarization results (lives within the pi process):
- * a compaction retry reuses already-computed chunks instead of re-calling the GPU. */
+/** In-memory cache of summarization results (lives within the pi process —
+ * and survives pi's in-process session switches: switchSession/fork/new_session
+ * rebind the session but keep this module loaded). Keys carry the run's scope
+ * (session id, summarizer ref, refine-call budgets), so a retry reuses
+ * already-computed chunks while another session/model/budget recomputes.
+ * Chunk-boundary inputs (sumCtx/ratio/safetyBudget/previousSummary) are
+ * deliberately NOT part of the scope: they manifest through the content
+ * hashes inside the keys. */
 const chunkCache = new Map<string, string>();
+/** Entries, not sessions; on overflow cacheSet clears the whole map. */
 const CHUNK_CACHE_MAX = 400;
 
 /** FNV-1a 32-bit, base36 — compact cache key. */
@@ -429,6 +436,20 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// approxTokensOfChars). Default 3: tuned for Cyrillic prose + JSON wrappers.
 		const charsPerToken = settings.charsPerToken ?? DEFAULTS.charsPerToken;
 
+		// Cache scope for this run: session id, summarizer ref and the budgets the
+		// refine call uses. Structural (not hashed): a 32-bit hash collision must
+		// not silently restore cross-session reuse. The session id in the scope
+		// means a fork/clone of a long session recomputes its cache instead of
+		// reusing it — accepted trade-off (isolation over reuse).
+		const cacheScope = [
+			ctx.sessionManager.getSessionId(),
+			settings.model,
+			maxPromptTokens,
+			maxTokens,
+			accCeiling,
+			charsPerToken,
+		].join("|");
+
 		// maxPromptTokens resolved above (budgets block); passed so chunking
 		// directly respects the prompt cap without preemptive splits.
 		const chunks = chunkByTurns(allMessages, ratio, sumCtx, safetyBudget, previousSummary, charsPerToken, maxPromptTokens);
@@ -546,7 +567,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		async function refineChunk(chunk: AgentMessage[], rawAcc: string | undefined, depth: number, retriedShrink = false): Promise<string> {
 			const accText = rawAcc ?? "";
 			const convText = serializeConversation(convertToLlm(chunk));
-			const key = `R|${fnv1a(convText)}|${fnv1a(accText)}|${fnv1a(customInstructions ?? "")}`;
+			const key = `R|${cacheScope}|${fnv1a(convText)}|${fnv1a(accText)}|${fnv1a(customInstructions ?? "")}`;
 			const cached = chunkCache.get(key);
 			if (cached !== undefined) {
 				cacheHits++;
@@ -613,7 +634,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			if (!accText) return accText;
 			const accTokens = approxTokensOfChars(accText.length, charsPerToken);
 			if (accTokens <= accCeiling) return accText;
-			const key = `C|${fnv1a(accText)}`;
+			const key = `C|${cacheScope}|${fnv1a(accText)}`;
 			const cached = chunkCache.get(key);
 			if (cached !== undefined) {
 				cacheHits++;
@@ -646,7 +667,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			const accTokens = approxTokensOfChars(accText.length, charsPerToken);
 			const target = Math.floor(maxTokens * accReplyFraction);
 			if (accTokens <= target) return accText;
-			const key = `S|${fnv1a(accText)}`;
+			const key = `S|${cacheScope}|${fnv1a(accText)}`;
 			const cached = chunkCache.get(key);
 			if (cached !== undefined) return cached;
 			const promptText = `<checkpoint>\n${accText}\n</checkpoint>\n\n${COMPRESS_PROMPT.replace("__TARGET__", String(target))}`;
