@@ -20,15 +20,16 @@ pi install git:github.com/Glashkoff/pi-refine-compact
 
 ## Use
 
-1. Run `/compact-model` in pi and pick the summarization model (the menu is the same style as `/model`, with context sizes shown).
+1. Run `/compact-model` in pi and pick the summarization mode (the menu is the same style as `/model`, with context sizes shown): `off — pi's native compaction`, `session — follow the chat's model`, or a fixed `provider/id`.
 2. Work until it's time to compact — manually via `/compact`, or automatically at the context threshold.
 
-That's it. Without a selected model — or when the extension is disabled — pi's stock behavior is used.
+That's it. `off` (the default) — or a disabled extension — leaves pi's stock behavior untouched; `session` runs the refine pipeline on whatever model the chat is using at compaction time.
 
 ## Notes
 
 - The model's own context window, when known, drives chunking; unknown windows fall back to 32k.
-- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session.
+- If the selected model disappears from the registry, a warning is shown and stock compaction proceeds for that session. `session` mode falls back to native the same way when the chat has no model (one info line, no nag), and warns when it is a virtual (router-only) entry, which cannot complete a request — the extension does no virtual routing.
+- `~` marks estimates: chars are converted to tokens by a rough `charsPerToken` ratio (±10–20% for prose).
 - Extensions run with full system access — review the source before installing (it's one file: `extensions/pi-refine-compact.ts`; the only network calls it makes are the summarizer LLM requests you configure).
 
 ## Settings
@@ -39,7 +40,7 @@ Every field is optional. An omitted field means **auto** — a formula derived f
 
 | Key | Type | Auto (default) | Meaning |
 |---|---|---|---|
-| `model` | `string` \| `null` | `null` — session model (stock behavior) | Summarizer as `provider/id`; also set by `/compact-model` |
+| `model` | `string` \| `null` | `null` — native (pi's stock compaction) | Summarizer as `provider/id`, `"session"` for the chat's current model, or `null` for native compaction; also set by `/compact-model` |
 | `maxPromptTokens` | int ≥ 0 | `min(32000, 0.5 × summarizer ctx)` | Hard cap on one summarizer request; a larger chunk is split preemptively |
 | `maxOutputTokens` | int ≥ 0 | `min(max(2048, 0.8 × reserveTokens), sumCtx − maxPromptTokens − ~1000)` | `maxTokens` for summarizer calls; clamped to the model's free headroom (the clamp applies to the auto value; an explicit setting is used as-is, with a warning if it exceeds the headroom) |
 | `summaryCeilingTokens` | int ≥ 0 | `min(0.35 × summarizer ctx, 0.5 × maxPromptTokens)` | When the accumulated summary exceeds this, the checkpoint itself is compressed |

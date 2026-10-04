@@ -2,6 +2,32 @@
 
 Notable changes per version (Keep a Changelog format, SemVer).
 
+
+## [0.2.1] - 2026-10-04
+
+### Added
+
+- **Session model as the summarizer.** `/compact-model` now offers three modes:
+  `off — pi's native compaction` (the default, `model: null`), `session — follow
+  the chat's model` (refines with whatever model the chat is using at compaction
+  time, captured once per run), and any fixed `provider/id`. A session with no
+  model falls back to native compaction with one info line.
+- **Virtual-model guard** (777972f): virtual (router-only) catalog entries are
+  filtered out of the `/compact-model` menu, and a summarizer that resolves to
+  one — saved ref or session model — loudly falls back to stock compaction
+  instead of failing the whole run.
+- **Test suite** (`bun test`) covering session mode, the guard, backwards
+  compatibility, and cache isolation.
+
+### Fixed
+
+- **Cached chunks no longer leak across sessions** (876613f): cache keys are
+  scoped by session id, resolved summarizer and derived budgets, so switching
+  any of them recomputes instead of reusing stale text. Guard idea from PR #1
+  by CloudedQuartz.
+- **Dead duplicate `throw` after the retry loop in `callSummarizer`** (1316fc2):
+  a leftover from c018351 was misindented past the loop body.
+
 ## [0.2.0] - 2026-10-01
 
 ### Fixed

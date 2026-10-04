@@ -5,7 +5,8 @@
  * Usage:
  *   /compact-model — pick the summarization model (menu like /model). The
  *   choice is persisted in $PI_CODING_AGENT_DIR/pi-refine-compact-settings.json.
- *   Empty selection = the session's default model (pi's stock behavior).
+ *   `null` = pi's stock compaction; `"session"` = refine with the session's
+ *   current model, captured once at compaction time; `"provider/id"` = that model.
  *
  * How it works:
  *   - Chunking: ratio = ceil(main_ctx / summarizer_ctx); the history is cut
@@ -33,7 +34,9 @@
  *     caching (scoped per session, summarizer and budgets) speeds up retries.
  *
  * Settings (all optional, all with sensible auto values):
- *   model               "provider/id" — summarizer model (also set via /compact-model)
+ *   model               "provider/id" summarizer, "session" for the session's current
+ *                       model, or null (default) for pi's stock compaction
+ *                       (also set via /compact-model)
  *   maxPromptTokens     hard cap on one summarizer request, chars-per-token based
  *   maxOutputTokens     maxTokens for summarizer calls
  *   summaryCeilingTokens  when the accumulated summary exceeds this, it is compressed
@@ -111,7 +114,7 @@ function parseSettings(raw: unknown, warn: (msg: string) => void): CompactorSett
 
 	if (typeof r.model === "string" && r.model) out.model = r.model;
 	const modelInvalid = r.model !== undefined && r.model !== null && !out.model;
-	if (modelInvalid) warn(`model: expected non-empty string — ignoring (using the session's model)`);
+	if (modelInvalid) warn(`model: expected non-empty string — ignoring (native: pi's stock compaction)`);
 
 	for (const key of ["maxPromptTokens", "maxOutputTokens", "summaryCeilingTokens"] as const) {
 		const parsed = optNonNegInt(r[key]);
@@ -140,8 +143,9 @@ function readSettings(warn: (msg: string) => void): CompactorSettings {
 function writeSettings(s: CompactorSettings): void {
 	const dir = agentDir();
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	// Persist only meaningful values: model null stays as a marker (session model),
-	// auto fields stay absent — the file contains only explicit overrides.
+	// Persist only meaningful values: model null stays as the native marker and
+	// "session" is stored verbatim (never rewritten to a concrete ref); auto
+	// fields stay absent — the file contains only explicit overrides.
 	const out: Record<string, unknown> = { model: s.model };
 	for (const key of ["maxPromptTokens", "maxOutputTokens", "summaryCeilingTokens"] as const) {
 		if (s[key] !== undefined) out[key] = s[key];
@@ -293,6 +297,9 @@ const NON_RETRYABLE_ERROR_PATTERN = /quota|insufficient|out of budget|usage limi
 // hence the local copy; switch to the real import if/when pi exports it.
 const VIRTUAL_MODEL_API = "pi-virtual";
 
+/** `settings.model` value that refines with the session's current model. */
+const SESSION_MODEL_MARKER = "session";
+
 /** Custom-entry type for the compaction progress log (durable, not sent to LLM). */
 const PROGRESS_ENTRY_TYPE = "refine-compact-progress";
 // ============================================================================
@@ -323,12 +330,16 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				}
 			}
 			const sessionLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no model)";
-			const items: string[] = [`(default) session model: ${sessionLabel}`];
-			const refs: (string | null)[] = [null];
+			const mark = (ref: string | null) => (current.model === ref ? "  ← current summarizer" : "");
+			const items: string[] = [
+				`off — pi's native compaction${mark(null)}`,
+				`session — follow the chat's model (current: ${sessionLabel})${mark(SESSION_MODEL_MARKER)}`,
+			];
+			const refs: (string | null)[] = [null, SESSION_MODEL_MARKER];
 			for (const m of available) {
 				const ref = `${m.provider}/${m.id}`;
 				const ctxK = m.contextWindow > 0 ? `${Math.round(m.contextWindow / 1000)}k ctx` : "ctx ?";
-				const marker = current.model === ref ? "  ← current summarizer" : "";
+				const marker = mark(ref);
 				items.push(`${ref}   [${ctxK}]${marker}`);
 				refs.push(ref);
 			}
@@ -357,10 +368,11 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			if (chosen === undefined) return; // cancelled
 			writeSettings({ ...current, model: chosen ?? null });
 			ctx.ui.notify(
-				chosen
-					? `Summarization will be performed by ${chosen}`
-					: "Summarization will use the current session model (stock pi behavior)",
-				"info",
+				chosen === SESSION_MODEL_MARKER
+					? `Summarization will be performed by the session model (${sessionLabel})`
+					: chosen
+						? `Summarization will be performed by ${chosen}`
+						: "Compaction stays on pi's stock behavior (native, no refinement)",
 			);
 		},
 	});
@@ -373,11 +385,20 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		const settings = readSettings((m) => ctx.ui.notify(`pi-refine-compact: ${m}`, "warning"));
 		if (!settings.model) return; // default — pi's stock behavior
 
-		const modelRef = parseModelRef(settings.model);
-		const found = modelRef ? ctx.modelRegistry.find(modelRef.provider, modelRef.id) : undefined;
+		const sessionMode = settings.model === SESSION_MODEL_MARKER;
+		const modelRef = sessionMode ? undefined : parseModelRef(settings.model);
+		// Session mode captures ctx.model exactly once here: the active model may
+		// change while the compaction runs, but the run stays on the captured one.
+		const found = sessionMode ? ctx.model : modelRef ? ctx.modelRegistry.find(modelRef.provider, modelRef.id) : undefined;
 		if (!found) {
-			// The model vanished from the registry — notify and fall back to stock (not silently).
-			ctx.ui.notify(`pi-refine-compact: model ${settings.model} not found — using stock compaction`, "warning");
+			// Session mode with no chat model is the mode's natural empty case —
+			// native compaction is the right outcome: one info line, no nag.
+			// A vanished explicit ref is a broken promise — warn. Never silent.
+			if (sessionMode) {
+				ctx.ui.notify("pi-refine-compact: session: no model — native compaction", "info");
+			} else {
+				ctx.ui.notify(`pi-refine-compact: model ${settings.model} not found — using stock compaction`, "warning");
+			}
 			return;
 		}
 
@@ -385,10 +406,11 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// as the summarizer would fail the whole compaction. Loud fallback to
 		// stock, same pattern as the "not found" branch above.
 		if (found.api === VIRTUAL_MODEL_API) {
-			ctx.ui.notify(`pi-refine-compact: ${settings.model} is a virtual (router) model and can't complete requests directly — using stock compaction`, "warning");
+			ctx.ui.notify(`pi-refine-compact: ${found.provider}/${found.id} is a virtual (router) model and can't complete requests directly — using stock compaction`, "warning");
 			return;
 		}
 		const model = found;
+		const resolvedRef = `${model.provider}/${model.id}`;
 
 		const { preparation, customInstructions, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
@@ -467,7 +489,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		// reusing it — accepted trade-off (isolation over reuse).
 		const cacheScope = [
 			ctx.sessionManager.getSessionId(),
-			settings.model,
+			resolvedRef,
 			maxPromptTokens,
 			maxTokens,
 			accCeiling,
@@ -577,7 +599,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				if (attempt < DEFAULTS.retryAttempts) {
 					const delayMs = Math.min(DEFAULTS.retryMaxDelayMs, DEFAULTS.retryBaseDelayMs * 2 ** (attempt - 1));
 					ctx.ui.notify(`pi-refine-compact: ${label} failed (${lastErr}) — retry ${attempt + 1}/${DEFAULTS.retryAttempts} in ${delayMs / 1000}s`, "warning");
-					progress(`${progressStatus()} (${settings.model}) — retrying in ${delayMs / 1000}s: ${lastErr}`);
+					progress(`${progressStatus()} (${resolvedRef}) — retrying in ${delayMs / 1000}s: ${lastErr}`);
 					await sleepMs(delayMs);
 					progress(`${progressStatus()} — retrying ${attempt + 1} / ${DEFAULTS.retryAttempts}`);
 					if (signal?.aborted) throw new Error("Compaction cancelled");
@@ -709,7 +731,16 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 
 		// Model + plan up front, one durable line per chunk, and a run summary —
 		// all in the transcript (appendEntry), never in the LLM context.
-		progress(`summarizing with ${settings.model} · ${chunks.length} chunk(s) · ~${Math.round(totalChars / charsPerToken / 1000)}k tok.`);
+		// Plan line: who, which mode, which window, how the input is served.
+		// Explicit caps only — auto values are model-derived constants, noise otherwise.
+		const capsNote =
+			settings.maxPromptTokens !== undefined || settings.maxOutputTokens !== undefined
+				? ` · cap ${Math.round(maxPromptTokens / 1000)}k prompt / ${Math.round(maxTokens / 1000)}k reply`
+				: "";
+		progress(
+			`summarizing with ${resolvedRef}${sessionMode ? " (session mode)" : ""} · summarizer ctx ${Math.round(sumCtx / 1000)}k · ` +
+				`${chunks.length} chunk${chunks.length === 1 ? "" : "s"} × ~${Math.round(totalChars / charsPerToken / chunks.length / 1000)}k tok${capsNote}`,
+		);
 		for (let i = 0; i < chunks.length; i++) {
 			if (signal?.aborted) throw new Error("Compaction cancelled");
 			currentChunk = i + 1;
@@ -718,8 +749,11 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 			acc = await refineChunk(chunks[i], acc, 0);
 			progress(progressStatus() + " — chunk done");
 		}
+		const inK = Math.round(totalChars / charsPerToken / 1000);
+		const outK = Math.round(acc.length / charsPerToken / 1000);
+		const cutPct = inK > 0 ? Math.max(0, Math.round((1 - outK / inK) * 100)) : 0;
 		progress(
-			`completed · chunks: ${chunks.length} · splits: ${retrySplits} · shrinks: ${shrinkCount} · ` +
+			`completed · ~${inK}k in → ~${outK}k out (${cutPct}% cut) · chunks: ${chunks.length} · splits: ${retrySplits} · shrinks: ${shrinkCount} · ` +
 			`${Math.round((Date.now() - startedAt) / 1000)}s`,
 		);
 
@@ -749,7 +783,7 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				details: {
 					readFiles,
 					modifiedFiles,
-					refineCompactModel: settings.model,
+					refineCompactModel: resolvedRef,
 					chunks: chunks.length,
 					retrySplits,
 					shrinkCount,

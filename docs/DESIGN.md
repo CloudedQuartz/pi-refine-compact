@@ -29,7 +29,7 @@ Every compaction run goes through the following stages.
 
 ### 0. Preconditions
 
-The extension hooks pi's `session_before_compact`. As soon as it fires, it reads the settings file and — if no summarizer model is configured — returns immediately, so stock compaction runs byte-for-byte. If a model *is* configured but has vanished from `ctx.modelRegistry`, a warning is shown and stock compaction is used for the session (never a silent switch). Once a model is resolved, `allMessages = messagesToSummarize + turnPrefixMessages` is the full body to compress.
+The extension hooks pi's `session_before_compact`. As soon as it fires, it reads the settings file and — if no summarizer is configured (`model: null`) — returns immediately, so stock compaction runs byte-for-byte. With `model: "session"` the summarizer is `ctx.model` captured once at that moment: the active model may change while the compaction runs, but the run stays on the captured one; a session with no chat model is the mode's natural empty case — one info line and native compaction (no warning). A virtual (router-only, `api: "pi-virtual"`) summarizer cannot complete a request and the extension does no virtual routing, so it warns and defers to stock. For an explicit `provider/id` that has vanished from `ctx.modelRegistry` the same applies — a warning is shown and stock compaction is used for the session (never a silent switch). Once a model is resolved, `allMessages = messagesToSummarize + turnPrefixMessages` is the full body to compress.
 
 ### 1. Budget derivation
 
@@ -127,7 +127,7 @@ The configurable settings are all derived in [Budget derivation](#1-budget-deriv
 
 ## Behavior contracts
 
-- **Stock fallback** — if no summarizer is selected (`model: null`) or a configured model is missing from `ctx.modelRegistry`, the extension defers to stock pi compaction. See [Stage 0](#0-preconditions).
+- **Stock fallback** — if no summarizer is selected (`model: null`), the chat has no model or a virtual one in `session` mode, or a configured model is missing from `ctx.modelRegistry`, the extension defers to stock pi compaction. See [Stage 0](#0-preconditions).
 - **Observability** — every stage reports via `ctx.ui.notify`, and the chunk-level progress ledger is written as durable custom entries (`pi.appendEntry` with a registered entry renderer): visible in the transcript, guaranteed not to enter the model context. The ledger shows model + plan up front, one line per chunk (index/percent), split levels, and a final run summary (chunks/splits/shrinks/elapsed).
 - **Model picker** — `/compact-model` reuses pi's own selector recipe (`Input` + `SelectList` + `fuzzyFilter` from `@earendil-works/pi-tui`), shown via `ctx.ui.custom()` in interactive TUI mode with a plain `ui.select` fallback elsewhere: compact, fuzzy-filtered, never overflows the screen.
-- **Post-mortem** — the returned `CompactionEntry` records `details.budgets`, `chunks`, `retrySplits`, `shrinkCount`, and `cacheHits`. See [Stage 6](#6-output-assembly).
+- **Post-mortem** — the returned `CompactionEntry` records `details.refineCompactModel` (the resolved `provider/id`, never the `session` marker), `details.budgets`, `chunks`, `retrySplits`, `shrinkCount`, and `cacheHits`. See [Stage 6](#6-output-assembly).
