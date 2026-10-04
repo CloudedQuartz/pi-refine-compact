@@ -287,6 +287,12 @@ class LengthCapError extends Error {
  * NON_RETRYABLE provider-limit family: quota/billing/usage limits). */
 const NON_RETRYABLE_ERROR_PATTERN = /quota|insufficient|out of budget|usage limit|billing|subscription/i;
 
+// pi's core/virtual-models.ts: VIRTUAL_MODEL_API = "pi-virtual" —
+// API id of virtual (router) catalog entries; requests for it fail
+// unless routed first. pi does not export the constant publicly,
+// hence the local copy; switch to the real import if/when pi exports it.
+const VIRTUAL_MODEL_API = "pi-virtual";
+
 /** Custom-entry type for the compaction progress log (durable, not sent to LLM). */
 const PROGRESS_ENTRY_TYPE = "refine-compact-progress";
 // ============================================================================
@@ -305,7 +311,17 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		description: "Choose the model used for compaction (/compact summarization)",
 		handler: async (_args, ctx) => {
 			const current = readSettings((m) => ctx.ui.notify(`pi-refine-compact: ${m}`, "warning"));
-			const available = ctx.modelRegistry.getAvailable();
+			const available = ctx.modelRegistry.getAvailable().filter((m) => m.api !== VIRTUAL_MODEL_API);
+
+			// The saved ref may name a virtual (router) model — such entries are
+			// filtered out of the list below — so warn before the menu hides it.
+			if (current.model) {
+				const currentRef = parseModelRef(current.model);
+				const currentFound = currentRef ? ctx.modelRegistry.find(currentRef.provider, currentRef.id) : undefined;
+				if (currentFound && currentFound.api === VIRTUAL_MODEL_API) {
+					ctx.ui.notify(`pi-refine-compact: current summarizer ${current.model} is a virtual (router) model — pick a physical model below`, "warning");
+				}
+			}
 			const sessionLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(no model)";
 			const items: string[] = [`(default) session model: ${sessionLabel}`];
 			const refs: (string | null)[] = [null];
@@ -362,6 +378,14 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 		if (!found) {
 			// The model vanished from the registry — notify and fall back to stock (not silently).
 			ctx.ui.notify(`pi-refine-compact: model ${settings.model} not found — using stock compaction`, "warning");
+			return;
+		}
+
+		// A virtual (router) model cannot complete requests directly — using it
+		// as the summarizer would fail the whole compaction. Loud fallback to
+		// stock, same pattern as the "not found" branch above.
+		if (found.api === VIRTUAL_MODEL_API) {
+			ctx.ui.notify(`pi-refine-compact: ${settings.model} is a virtual (router) model and can't complete requests directly — using stock compaction`, "warning");
 			return;
 		}
 		const model = found;
