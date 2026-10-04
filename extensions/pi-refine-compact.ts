@@ -560,7 +560,6 @@ export default function piRefineCompactExtension(pi: ExtensionAPI) {
 				}
 			}
 			throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
-		throw new Error(`pi-refine-compact: ${label}: ${lastErr}`);
 		}
 
 		/** Refine one chunk; on length-cap — split shallow, or shrink the running summary when deep (C1). */
